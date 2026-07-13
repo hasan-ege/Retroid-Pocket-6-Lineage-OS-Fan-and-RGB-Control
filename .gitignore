@@ -1,0 +1,18 @@
+# Ignore PULSE app source that we analyzed
+pulse-main/
+
+# Ignore local properties and IDE files
+local.properties
+.idea/
+.gradle/
+
+# Ignore general outputs and temp stuff
+*.png
+!icon.png
+*.log
+
+# Ignore Android build directories inside subfolders just in case
+**/build/
+**/.gradle/
+**/local.properties
+**/.navigation/

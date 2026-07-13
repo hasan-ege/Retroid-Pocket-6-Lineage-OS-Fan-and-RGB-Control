@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Root shell permissions -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+
+    <application
+        android:name=".HandheldSettingsApp"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:windowSoftInputMode="adjustResize"
+        android:theme="@style/Theme.HandheldSettings">
+
+        <activity
+            android:name=".MainActivity"
+            android:taskAffinity="com.android.settings"
+            android:excludeFromRecents="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Settings Injection (IA_SETTINGS) to embed app in AOSP Settings -->
+            <intent-filter>
+                <action android:name="com.android.settings.action.IA_SETTINGS" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data android:name="com.android.settings.title"
+                android:resource="@string/app_name" />
+            <meta-data android:name="com.android.settings.category"
+                android:value="com.android.settings.category.ia.homepage" />
+            <meta-data android:name="com.android.settings.group_key"
+                android:value="top_level_personalize_category" />
+            <meta-data android:name="com.android.settings.summary"
+                android:value="Fan, CPU, RGB ve ekran ayarları" />
+            <meta-data android:name="com.android.settings.icon"
+                android:resource="@drawable/ic_settings_icon" />
+            <meta-data android:name="com.android.settings.bg.argb"
+                android:value="-10453621" />
+            <meta-data android:name="com.android.settings.bg.hint"
+                android:resource="@android:color/holo_purple" />
+            <meta-data android:name="com.android.settings.icon_color_scheme"
+                android:value="purple" />
+            <meta-data android:name="com.android.settings.order"
+                android:value="-250" />
+        </activity>
+
+        <!-- Background service that manages fan/CPU/battery loops -->
+        <service
+            android:name=".service.SystemControlService"
+            android:foregroundServiceType="specialUse"
+            android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="hardware_control" />
+        </service>
+
+        <!-- Boot receiver to auto-restart the service -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Fan Quick Settings Tile -->
+        <service
+            android:name=".tile.FanQuickSettingsTile"
+            android:exported="true"
+            android:label="Fan Mode"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!-- Refresh Rate Quick Settings Tile -->
+        <service
+            android:name=".tile.RefreshRateTileService"
+            android:exported="true"
+            android:label="Refresh Rate"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+    </application>
+
+</manifest>
