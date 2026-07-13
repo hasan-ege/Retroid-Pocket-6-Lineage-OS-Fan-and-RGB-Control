@@ -14,5 +14,7 @@ enum class RgbMode(val label: String) {
     BREATHE("Pulse/Breathe"),
     AMBILIGHT("Ambilight"),
     BATTERY("Battery Level"),
-    THERMAL("SoC Temperature")
+    THERMAL("SoC Temperature");
+
+    fun next(): RgbMode = entries[(ordinal + 1) % entries.size]
 }
