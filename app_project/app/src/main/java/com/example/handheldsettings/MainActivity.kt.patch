@@ -1,0 +1,27 @@
+--- app/src/main/java/com/example/handheldsettings/MainActivity.kt
++++ app/src/main/java/com/example/handheldsettings/MainActivity.kt
+@@ -10,6 +10,8 @@
+ import androidx.compose.material3.Surface
+ import androidx.compose.ui.Modifier
+ import com.example.handheldsettings.ui.DashboardScreen
++import android.view.KeyEvent
++import android.view.MotionEvent
++import android.util.Log
+ 
+ class MainActivity : ComponentActivity() {
+ 
+@@ -29,4 +31,14 @@
+             }
+         }
+     }
++
++    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
++        Log.i("MainActivityInput", "dispatchKeyEvent: action=${event.action} keyCode=${event.keyCode}")
++        return super.dispatchKeyEvent(event)
++    }
++
++    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
++        Log.i("MainActivityInput", "dispatchGenericMotionEvent: action=${event.action} source=${event.source}")
++        return super.dispatchGenericMotionEvent(event)
++    }
+ }

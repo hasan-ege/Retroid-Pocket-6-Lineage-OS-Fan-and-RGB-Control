@@ -5,11 +5,13 @@
     <!-- Root shell permissions -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:name=".HandheldSettingsApp"
@@ -58,12 +60,18 @@
         <!-- Background service that manages fan/CPU/battery loops -->
         <service
             android:name=".service.SystemControlService"
-            android:foregroundServiceType="specialUse"
+            android:foregroundServiceType="specialUse|mediaProjection"
             android:exported="false">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="hardware_control" />
         </service>
+        
+        <activity
+            android:name=".service.MediaProjectionActivity"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:exported="false" />
 
         <!-- Boot receiver to auto-restart the service -->
         <receiver

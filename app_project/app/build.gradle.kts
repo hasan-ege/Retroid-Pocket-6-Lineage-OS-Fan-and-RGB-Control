@@ -11,14 +11,24 @@ android {
         applicationId = "com.example.handheldsettings"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1.0"
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file("/home/hasan/ANDROİD STUDİO KEYS DO NOT KİLL/key.jks")
+            storePassword = "Z&g788310"
+            keyAlias = "key0"
+            keyPassword = "Z&g788310"
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {

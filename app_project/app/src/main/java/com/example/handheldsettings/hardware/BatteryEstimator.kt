@@ -1,12 +1,12 @@
 package com.example.handheldsettings.hardware
 
 import android.util.Log
-import com.topjohnwu.superuser.Shell
 
 /**
  * Battery life estimator (RP6_Complete_Guide.md §14).
  *
- * Reads sysfs power_supply files (no root required, but we use Shell for consistency).
+ * Reads sysfs power_supply files using native Java I/O.
+ * Caches which paths require root to avoid repeated SELinux denial spam.
  * Uses a moving average over 10 samples to smooth out instantaneous spikes.
  */
 object BatteryEstimator {
@@ -14,6 +14,17 @@ object BatteryEstimator {
     private const val TAG = "BatteryEstimator"
 
     private val drainAvg = MovingAverage(windowSize = 10)
+
+    // Cache: paths that failed native read are marked here.
+    // Once a path fails with native I/O, we only use Shell.cmd for it.
+    // Once Shell.cmd also fails, we mark it as permanently failed to stop all retries.
+    private val pathAccessMode = HashMap<String, AccessMode>(4)
+
+    private enum class AccessMode {
+        NATIVE,      // Try native first (default for new paths)
+        ROOT_ONLY,   // Native failed, use root shell
+        FAILED       // Both failed, don't retry
+    }
 
     /**
      * Returns estimated remaining minutes, or null if:
@@ -39,13 +50,35 @@ object BatteryEstimator {
         return readLong("/sys/class/power_supply/battery/capacity")?.toInt() ?: -1
     }
 
-    private fun readLong(path: String): Long? =
-        try {
-            java.io.File(path).readText().trim().toLongOrNull()
-        } catch (e: Exception) {
-            // Fall back to Shell if direct read fails (permission issues on some configs)
-            Shell.cmd("cat $path").exec().out.firstOrNull()?.trim()?.toLongOrNull()
+    private fun readLong(path: String): Long? {
+        val mode = pathAccessMode.getOrPut(path) { AccessMode.NATIVE }
+
+        return when (mode) {
+            AccessMode.NATIVE -> {
+                try {
+                    java.io.File(path).readText().trim().toLongOrNull()
+                } catch (e: Exception) {
+                    // Native read failed (likely SELinux denial) — switch to root
+                    Log.i(TAG, "Native read failed for $path, switching to root-only")
+                    pathAccessMode[path] = AccessMode.ROOT_ONLY
+                    readViaRoot(path)
+                }
+            }
+            AccessMode.ROOT_ONLY -> readViaRoot(path)
+            AccessMode.FAILED -> null
         }
+    }
+
+    private fun readViaRoot(path: String): Long? {
+        return try {
+            com.topjohnwu.superuser.Shell.cmd("cat $path").exec()
+                .out.firstOrNull()?.trim()?.toLongOrNull()
+        } catch (e: Exception) {
+            Log.w(TAG, "Root read also failed for $path, marking as permanently failed")
+            pathAccessMode[path] = AccessMode.FAILED
+            null
+        }
+    }
 }
 
 /** Sliding window moving average. */

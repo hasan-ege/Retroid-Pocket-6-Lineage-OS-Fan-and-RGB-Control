@@ -19,8 +19,8 @@ import kotlinx.coroutines.launch
  * Clockwise visual rotation: baseHue DECREASES over time.
  * (baseHue += speed → counter-clockwise; baseHue -= speed → clockwise)
  *
- * Performance note (§16.7): brightness is written ONCE outside the tick loop;
- * only multi_intensity is updated each tick, halving write count.
+ * Uses JoystickRgbController.executeFastRaw() with pre-computed paths
+ * and a reusable StringBuilder for zero-allocation animation frames.
  */
 class RotatingRainbowAnimator(
     private val scope: CoroutineScope,
@@ -38,6 +38,19 @@ class RotatingRainbowAnimator(
         Corner.BOTTOM_LEFT  to 270f
     )
 
+    // Pre-computed LED sysfs paths for both sticks × all corners
+    private data class LedEntry(val path: String, val corner: Corner)
+    private val ledEntries: List<LedEntry> = buildList {
+        for (stick in Stick.entries) {
+            for (corner in Corner.entries) {
+                add(LedEntry(JoystickRgbController.ledPath(stick, corner), corner))
+            }
+        }
+    }
+
+    // Reusable buffer — avoids heap allocation every frame
+    private val frameBuffer = StringBuilder(512)
+
     fun start() {
         stop()
         // Set brightness once before the loop
@@ -45,34 +58,13 @@ class RotatingRainbowAnimator(
 
         job = scope.launch(Dispatchers.IO) {
             while (isActive) {
-                // Build all 16 intensity commands in one Shell.cmd() call
-                val commands = buildList {
-                    for (stick in Stick.entries) {
-                        for (corner in Corner.entries) {
-                            val cornerHue = (hue + (cornerPhase[corner] ?: 0f) + 360f) % 360f
-                            val (r, g, b) = hsvToRgb(cornerHue)
-                            val prefix = if (stick == Stick.LEFT) "left" else "right"
-                            // Recompute index per the same maps as JoystickRgbController
-                            val index = when (stick) {
-                                Stick.LEFT -> when (corner) {
-                                    Corner.TOP_LEFT     -> 0
-                                    Corner.BOTTOM_LEFT  -> 1
-                                    Corner.BOTTOM_RIGHT -> 2
-                                    Corner.TOP_RIGHT    -> 3
-                                }
-                                Stick.RIGHT -> when (corner) {
-                                    Corner.BOTTOM_RIGHT -> 0
-                                    Corner.TOP_RIGHT    -> 1
-                                    Corner.TOP_LEFT     -> 2
-                                    Corner.BOTTOM_LEFT  -> 3
-                                }
-                            }
-                            val base = "/sys/class/leds/$prefix:stick:$index"
-                            add("echo \"$r $g $b\" > $base/multi_intensity")
-                        }
-                    }
+                frameBuffer.setLength(0)
+                for (entry in ledEntries) {
+                    val cornerHue = (hue + (cornerPhase[entry.corner] ?: 0f) + 360f) % 360f
+                    val (r, g, b) = hsvToRgb(cornerHue)
+                    frameBuffer.append("echo \"$r $g $b\" > ${entry.path}/multi_intensity\n")
                 }
-                com.topjohnwu.superuser.Shell.cmd(*commands.toTypedArray()).exec()
+                JoystickRgbController.executeFastRaw(frameBuffer.toString())
 
                 // Clockwise rotation: decrease hue
                 hue = (hue - speedDegPerTick + 360f) % 360f

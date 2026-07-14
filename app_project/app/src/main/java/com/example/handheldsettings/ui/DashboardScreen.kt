@@ -285,7 +285,7 @@ fun DashboardScreen(vm: DashboardViewModel = viewModel()) {
                     summary = "LED controls & presets",
                     onClick = { showRgbDialog = true }
                 )
-                if (state.rgbMode == RgbMode.STATIC || state.rgbMode == RgbMode.BREATHE) {
+                if (state.rgbMode == RgbMode.STATIC || state.rgbMode == RgbMode.BREATHE || state.rgbMode == RgbMode.STROBE || state.rgbMode == RgbMode.METEOR) {
                     HorizontalDivider(modifier = Modifier.padding(horizontal = 24.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                     AospColorPresetRow(
                         title = "Color presets",
@@ -380,7 +380,7 @@ fun DashboardScreen(vm: DashboardViewModel = viewModel()) {
     }
 
     if (showRgbDialog) {
-        val rgbModes = listOf(RgbMode.OFF, RgbMode.STATIC, RgbMode.RAINBOW, RgbMode.BREATHE, RgbMode.AMBILIGHT, RgbMode.BATTERY, RgbMode.THERMAL)
+        val rgbModes = RgbMode.entries.toList()
         AospPreferenceDialog(
             title = "Joystick RGB",
             items = rgbModes,

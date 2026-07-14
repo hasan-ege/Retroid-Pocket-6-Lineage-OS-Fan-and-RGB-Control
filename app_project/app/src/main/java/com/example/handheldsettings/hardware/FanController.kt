@@ -9,8 +9,8 @@ import com.topjohnwu.superuser.Shell
  * Key spec from RP6_Complete_Guide.md section 1:
  * - Path discovered dynamically by scanning cooling_device type files for "pwm-fan".
  * - cur_state accepts integers 0-8.
- * - Kernel step_wise governor overrides ~1s after a write, so we write in a 300ms loop.
- * - SMART mode = do NOT write; let the kernel govern naturally.
+ * - When kernel thermal control is disabled, we write directly to sysfs.
+ * - SMART mode = let the kernel govern naturally (we stop writing).
  */
 object FanController {
 
@@ -20,6 +20,10 @@ object FanController {
     /** Cached path, discovered once at first use. */
     @Volatile
     private var cachedPath: String? = null
+
+    /** Caches the last written target state to avoid duplicate sysfs writes. */
+    @Volatile
+    private var lastTarget: Int? = null
 
     /**
      * Dynamically discovers the cooling device path for the pwm-fan.
@@ -62,52 +66,65 @@ object FanController {
     }
 
     /**
-     * Writes the target fan level to the local target file.
-     * The background shell loop reads this file and writes it to sysfs every 50ms.
+     * Writes the target fan level directly to sysfs.
+     * Caches the value to avoid redundant writes.
      */
     fun writeCurState(context: android.content.Context, value: Int) {
         val clamped = value.coerceIn(0, 8)
-        val file = java.io.File(context.filesDir, "fan_target")
-        try {
-            val current = if (file.exists()) file.readText().trim() else ""
-            if (current != clamped.toString()) {
-                file.writeText(clamped.toString())
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to write target to file: ${e.message}")
+        if (lastTarget != clamped) {
+            val path = discoverFanPath() ?: return
+            Shell.cmd("echo $clamped > $path/cur_state 2>/dev/null").exec()
+            lastTarget = clamped
         }
     }
 
-    /** Sets the target state to SMART (Auto). */
+    /** Sets the target state to SMART (Auto). Resets the cache so custom curves work on re-enable. */
     fun writeSmartMode(context: android.content.Context) {
-        val file = java.io.File(context.filesDir, "fan_target")
-        try {
-            val current = if (file.exists()) file.readText().trim() else ""
-            if (current != "SMART") {
-                file.writeText("SMART")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to write SMART to file: ${e.message}")
-        }
+        lastTarget = null
     }
+
+    private var cachedThermalZones: List<java.io.File>? = null
 
     /**
      * Reads the highest temperature across all thermal zones (in Celsius).
      * Used by the watchdog in SystemControlService.
      */
     fun readMaxTempCelsius(): Double {
-        val script = """
-            for z in $THERMAL_BASE/thermal_zone*; do
-                t=${'$'}(cat "${'$'}z/type" 2>/dev/null)
-                case "${'$'}t" in
-                    *cpu*|*gpu*) cat "${'$'}z/temp" 2>/dev/null ;;
-                esac
-            done
-        """.trimIndent()
-        val result = Shell.cmd(script).exec()
-        val maxMilliC = result.out
-            .mapNotNull { it.trim().toLongOrNull() }
-            .maxOrNull() ?: return 0.0
+        if (cachedThermalZones == null) {
+            val baseDir = java.io.File(THERMAL_BASE)
+            val zones = mutableListOf<java.io.File>()
+            if (baseDir.exists() && baseDir.isDirectory) {
+                baseDir.listFiles()?.forEach { dir ->
+                    if (dir.name.startsWith("thermal_zone")) {
+                        try {
+                            val type = java.io.File(dir, "type").readText().trim()
+                            if (type.contains("cpu") || type.contains("gpu")) {
+                                val tempFile = java.io.File(dir, "temp")
+                                if (tempFile.exists()) {
+                                    zones.add(tempFile)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            // Ignore unreadable zones
+                        }
+                    }
+                }
+            }
+            cachedThermalZones = zones
+        }
+
+        var maxMilliC = 0.0
+        cachedThermalZones?.forEach { file ->
+            try {
+                val temp = file.readText().trim().toDoubleOrNull()
+                if (temp != null && temp > maxMilliC) {
+                    maxMilliC = temp
+                }
+            } catch (e: Exception) {
+                // Ignore
+            }
+        }
+        
         return maxMilliC / 1000.0
     }
 }

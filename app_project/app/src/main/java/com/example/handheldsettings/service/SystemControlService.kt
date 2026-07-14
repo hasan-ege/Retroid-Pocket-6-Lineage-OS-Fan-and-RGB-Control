@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.os.IBinder
 import android.util.Log
@@ -18,12 +19,15 @@ import com.example.handheldsettings.data.Prefs
 import com.example.handheldsettings.data.RgbMode
 import com.example.handheldsettings.data.FanCurvePoint
 import com.example.handheldsettings.data.FanCurveSerializer
+import com.example.handheldsettings.data.Stick
+import com.example.handheldsettings.data.Corner
 import com.example.handheldsettings.hardware.BatteryEstimator
 import com.example.handheldsettings.hardware.CpuModeController
 import com.example.handheldsettings.hardware.FanController
 import com.example.handheldsettings.hardware.FractionalStateDither
 import com.example.handheldsettings.hardware.JoystickRgbController
 import com.example.handheldsettings.hardware.RotatingRainbowAnimator
+import com.example.handheldsettings.hardware.hsvToRgb
 import com.example.handheldsettings.hardware.FanTempController
 import com.example.handheldsettings.hardware.FpsReader
 import com.example.handheldsettings.overlay.PerformanceOverlay
@@ -35,6 +39,15 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.graphics.PixelFormat
+import android.os.Handler
+import android.os.Looper
+import kotlinx.coroutines.yield
 
 /**
  * Unified background foreground service (RP6_Complete_Guide.md §6.3, §14.3).
@@ -59,6 +72,8 @@ class SystemControlService : Service() {
         private const val NOTIF_ID = 1
 
         const val ACTION_UPDATE = "com.example.handheldsettings.UPDATE"
+        const val ACTION_SET_PROJECTION_INTENT = "com.example.handheldsettings.SET_PROJECTION_INTENT"
+        const val EXTRA_PROJECTION_INTENT = "projection_intent"
 
         fun startOrUpdate(context: Context) {
             val intent = Intent(context, SystemControlService::class.java)
@@ -70,8 +85,14 @@ class SystemControlService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var fanJob: Job? = null
     private var batteryJob: Job? = null
+    private var autoTdpJob: Job? = null
+    
+    private var mediaProjectionIntent: Intent? = null
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    
     private var rainbowAnimator: RotatingRainbowAnimator? = null
-    private var daemonProcess: Process? = null
 
     private lateinit var prefs: SharedPreferences
     private lateinit var notifManager: NotificationManager
@@ -92,7 +113,32 @@ class SystemControlService : Service() {
     @Volatile private var autoTdpTargetFps = 60
     @Volatile private var kernelThermalControlEnabled = true
     private var performanceOverlay: PerformanceOverlay? = null
-    private var autoTdpJob: Job? = null
+    private var isScreenOff = false
+    // Dirty flag: only rebuild notification when content actually changes
+    @Volatile private var lastNotifText: String = ""
+    // Pre-allocated animation buffer to avoid per-frame heap allocation
+    private val animBuffer = StringBuilder(512)
+    private val screenReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    isScreenOff = true
+                    Log.i(TAG, "Screen OFF -> Suspending fan + RGB")
+                    // Suspend RGB animations to save power & reduce heat
+                    rgbInfoJob?.cancel()
+                    rgbInfoJob = null
+                    rainbowAnimator?.stop()
+                    JoystickRgbController.turnOff()
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    isScreenOff = false
+                    Log.i(TAG, "Screen ON -> Resuming fan + RGB")
+                    // Resume RGB animation
+                    applyRgb()
+                }
+            }
+        }
+    }
     @Volatile private var autoTdpPct = 1.0
 
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
@@ -135,19 +181,30 @@ class SystemControlService : Service() {
         createNotificationChannel()
         loadAllPrefs()
 
-        startBackgroundShellDaemon()
-
         startForeground(NOTIF_ID, buildNotification())
         startLoops()
         applyRgb()
         applyOverlayState()
         applyAutoTdpState()
 
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        registerReceiver(screenReceiver, filter)
+
         prefs.registerOnSharedPreferenceChangeListener(prefListener)
         Log.i(TAG, "SystemControlService started")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_SET_PROJECTION_INTENT) {
+            mediaProjectionIntent = intent.getParcelableExtra(EXTRA_PROJECTION_INTENT)
+            Log.i(TAG, "Received MediaProjection intent token, restarting RGB...")
+            applyRgb()
+            return START_STICKY
+        }
+        
         // Re-apply everything on each start (e.g. after boot)
         loadAllPrefs()
         updateNotification()
@@ -162,20 +219,23 @@ class SystemControlService : Service() {
         performanceOverlay = null
         autoTdpJob?.cancel()
         autoTdpJob = null
+        try { unregisterReceiver(screenReceiver) } catch(e: Exception) {}
         serviceScope.cancel()
         
         // Re-enable kernel thermal control for system safety on shutdown
         applyKernelThermalControl(true)
 
-        // Stop the background shell loop by deleting the sentinel file
-        java.io.File(filesDir, "service_running").delete()
-        java.io.File(filesDir, "fan_target").delete()
-        daemonProcess?.destroy()
+        // Clean up persistent su process
+        JoystickRgbController.destroy()
         
         Log.i(TAG, "SystemControlService destroyed")
     }
 
+    private var lastThermalStateApplied: Boolean? = null
+
     private fun applyKernelThermalControl(enabled: Boolean) {
+        if (enabled == lastThermalStateApplied) return
+        lastThermalStateApplied = enabled
         val mode = if (enabled) "enabled" else "disabled"
         val script = """
             for z in 14 15 33 34 53; do
@@ -184,60 +244,6 @@ class SystemControlService : Service() {
         """.trimIndent()
         com.topjohnwu.superuser.Shell.cmd(script).submit()
         Log.i(TAG, "Applied kernel thermal control: $mode")
-    }
-
-    private fun startBackgroundShellDaemon() {
-        val path = FanController.discoverFanPath() ?: return
-        try {
-            java.io.File(filesDir, "service_running").createNewFile()
-            java.io.File(filesDir, "fan_target").writeText("SMART")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to create daemon files: ${e.message}")
-        }
-
-        // Spawn a completely independent root shell process to run our loop.
-        // Ticks every 50ms to aggressively override the kernel governor with 0ms IPC delay.
-        serviceScope.launch(Dispatchers.IO) {
-            try {
-                val proc = Runtime.getRuntime().exec("su")
-                daemonProcess = proc
-                val writer = proc.outputStream.bufferedWriter()
-                
-                val script = """
-                    counter=0
-                    last_target=""
-                    while [ -f ${filesDir.absolutePath}/service_running ]; do
-                        if [ -f ${filesDir.absolutePath}/fan_target ]; then
-                            target=${'$'}(cat ${filesDir.absolutePath}/fan_target 2>/dev/null)
-                            if [ "${'$'}target" != "SMART" ] && [ ! -z "${'$'}target" ]; then
-                                if [ "${'$'}target" != "${'$'}last_target" ]; then
-                                    echo "${'$'}target" > $path/cur_state 2>/dev/null
-                                    actual=${'$'}(cat $path/cur_state 2>/dev/null)
-                                    log -t FanDaemon "Target=${'$'}target Actual=${'$'}actual"
-                                    last_target="${'$'}target"
-                                fi
-                            elif [ "${'$'}target" = "SMART" ] && [ "${'$'}target" != "${'$'}last_target" ]; then
-                                log -t FanDaemon "Switched to SMART mode"
-                                last_target="SMART"
-                            fi
-                        fi
-                        counter=${'$'}((counter + 1))
-                        sleep 0.2
-                    done
-                    exit
-                """.trimIndent()
-                
-                writer.write(script)
-                writer.newLine()
-                writer.flush()
-                
-                proc.waitFor()
-                Log.i(TAG, "Background shell fan daemon exited cleanly")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error in background shell fan daemon: ${e.message}")
-            }
-        }
-        Log.i(TAG, "Background shell fan daemon started")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -266,20 +272,25 @@ class SystemControlService : Service() {
                 val mode = currentFanMode
                 val tempC = FanController.readMaxTempCelsius()
 
-                if (kernelThermalControlEnabled) {
+                val screenOffOverride = isScreenOff && tempC < 70.0
+
+                if (screenOffOverride) {
+                    applyKernelThermalControl(false)
+                    FanController.writeCurState(applicationContext, 0)
+                    tempController.reset()
+                    watchdogActive = false
+                } else if (kernelThermalControlEnabled || (mode == FanMode.SMART && tempC <= 75.0)) {
+                    applyKernelThermalControl(true)
                     FanController.writeSmartMode(applicationContext)
                     tempController.reset()
                     watchdogActive = false
                 } else {
+                    applyKernelThermalControl(false)
                     // Watchdog: if temp > 75°C and mode is too low, force fan up
                     val watchdogOverride = tempC > 75.0 && mode.targetState in 0..3
                     watchdogActive = watchdogOverride
 
-                    if (mode == FanMode.SMART && !watchdogOverride) {
-                        FanController.writeSmartMode(applicationContext)
-                        tempController.reset()
-                    } else {
-                        val target: Int = when {
+                    val target: Int = when {
                             watchdogOverride -> 6   // force high during overheat
                             mode == FanMode.CUSTOM -> {
                                 val lvl = when {
@@ -303,9 +314,10 @@ class SystemControlService : Service() {
                         }
                         FanController.writeCurState(applicationContext, target)
                     }
-                }
 
-                delay(150L)
+                // Adaptive polling: faster when hot, slower when cool (firmware-grade)
+                val pollInterval = if (tempC > 65.0) 300L else 500L
+                delay(pollInterval)
             }
         }
     }
@@ -317,7 +329,7 @@ class SystemControlService : Service() {
                 batteryMins = BatteryEstimator.estimateRemainingMinutes()
                 batteryPct  = BatteryEstimator.readCapacityPercent()
                 updateNotification()
-                delay(5_000L)
+                delay(10_000L) // 10s interval — firmware-grade, reduces CPU + SELinux churn
             }
         }
     }
@@ -362,7 +374,6 @@ class SystemControlService : Service() {
         rgbInfoJob = null
         rainbowAnimator?.stop()
         rainbowAnimator = null
-
         val mode = runCatching {
             RgbMode.valueOf(prefs.getString(Prefs.RGB_MODE, RgbMode.OFF.name) ?: RgbMode.OFF.name)
         }.getOrDefault(RgbMode.OFF)
@@ -405,17 +416,13 @@ class SystemControlService : Service() {
                             increment = 0.05f
                             delay(400L) // longer pause at lowest brightness
                         }
-                        delay(80L)
+                        delay(120L)
                     }
                 }
             }
             RgbMode.AMBILIGHT -> {
                 rgbInfoJob = serviceScope.launch {
-                    while (isActive) {
-                        val color = getAverageScreenColor()
-                        JoystickRgbController.setAll(color.first, color.second, color.third, br)
-                        delay(350L) // responsive but not spammy
-                    }
+                    startAmbilightLoop(br)
                 }
             }
             RgbMode.BATTERY -> {
@@ -438,99 +445,379 @@ class SystemControlService : Service() {
                     }
                 }
             }
+            RgbMode.WAVE -> {
+                rgbInfoJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    var hue = 0f
+                    val ledPaths = buildLedPathPairs()
+                    while (isActive) {
+                        animBuffer.setLength(0)
+                        for ((idx, path) in ledPaths.withIndex()) {
+                            val h = (hue + idx * 45f) % 360f
+                            val (r, g, b) = hsvToRgb(h)
+                            animBuffer.append("echo \"$r $g $b\" > $path/multi_intensity\necho $br > $path/brightness\n")
+                        }
+                        JoystickRgbController.executeFastRaw(animBuffer.toString())
+                        hue = (hue + 3f) % 360f
+                        delay(100L)
+                    }
+                }
+            }
+            RgbMode.COLOR_CYCLE -> {
+                rgbInfoJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    var hue = 0f
+                    while (isActive) {
+                        val (r, g, b) = hsvToRgb(hue)
+                        JoystickRgbController.setAll(r, g, b, br)
+                        hue = (hue + 1f) % 360f
+                        delay(120L)
+                    }
+                }
+            }
+            RgbMode.STROBE -> {
+                rgbInfoJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val r = prefs.getInt(Prefs.RGB_COLOR_R, 255)
+                    val g = prefs.getInt(Prefs.RGB_COLOR_G, 255)
+                    val b = prefs.getInt(Prefs.RGB_COLOR_B, 255)
+                    var on = true
+                    while (isActive) {
+                        if (on) JoystickRgbController.setAll(r, g, b, br)
+                        else JoystickRgbController.setBrightnessAll(0)
+                        on = !on
+                        delay(120L)
+                    }
+                }
+            }
+            RgbMode.METEOR -> {
+                rgbInfoJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val r = prefs.getInt(Prefs.RGB_COLOR_R, 255)
+                    val g = prefs.getInt(Prefs.RGB_COLOR_G, 255)
+                    val b = prefs.getInt(Prefs.RGB_COLOR_B, 255)
+                    val ledList = buildLedList()
+                    var head = 0
+                    while (isActive) {
+                        animBuffer.setLength(0)
+                        for ((i, led) in ledList.withIndex()) {
+                            val dist = (head - i + ledList.size) % ledList.size
+                            val fadeBr = when {
+                                dist == 0 -> br
+                                dist == 1 -> (br * 0.6f).toInt()
+                                dist == 2 -> (br * 0.3f).toInt()
+                                dist == 3 -> (br * 0.1f).toInt()
+                                else -> 0
+                            }.coerceIn(0, 255)
+                            animBuffer.append("echo \"$r $g $b\" > $led/multi_intensity\necho $fadeBr > $led/brightness\n")
+                        }
+                        JoystickRgbController.executeFastRaw(animBuffer.toString())
+                        head = (head + 1) % ledList.size
+                        delay(120L)
+                    }
+                }
+            }
+            RgbMode.FIRE -> {
+                rgbInfoJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val rng = java.util.Random()
+                    val ledPaths = buildLedPathPairs()
+                    while (isActive) {
+                        animBuffer.setLength(0)
+                        for (path in ledPaths) {
+                            val r = 200 + rng.nextInt(56)
+                            val g = rng.nextInt(120)
+                            val b = rng.nextInt(20)
+                            val flicker = (br * (0.4f + rng.nextFloat() * 0.6f)).toInt().coerceIn(0, 255)
+                            animBuffer.append("echo \"$r $g $b\" > $path/multi_intensity\necho $flicker > $path/brightness\n")
+                        }
+                        JoystickRgbController.executeFastRaw(animBuffer.toString())
+                        delay(100L + rng.nextInt(60).toLong())
+                    }
+                }
+            }
+            RgbMode.AURORA -> {
+                rgbInfoJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    var time = 0f
+                    val ledPaths = buildLedPathPairs()
+                    while (isActive) {
+                        animBuffer.setLength(0)
+                        for ((idx, path) in ledPaths.withIndex()) {
+                            val phase = time + idx * 0.8f
+                            val hue = 120f + 120f * kotlin.math.sin(phase.toDouble()).toFloat()
+                            val (r, g, b) = hsvToRgb(hue.coerceIn(0f, 359f), 0.8f, 1f)
+                            val drift = (br * (0.5f + 0.5f * kotlin.math.sin((phase * 0.7f).toDouble()).toFloat())).toInt().coerceIn(0, 255)
+                            animBuffer.append("echo \"$r $g $b\" > $path/multi_intensity\necho $drift > $path/brightness\n")
+                        }
+                        JoystickRgbController.executeFastRaw(animBuffer.toString())
+                        time += 0.05f
+                        delay(100L)
+                    }
+                }
+            }
+            RgbMode.OCEAN -> {
+                rgbInfoJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    var time = 0f
+                    val ledPaths = buildLedPathPairs()
+                    while (isActive) {
+                        animBuffer.setLength(0)
+                        for ((idx, path) in ledPaths.withIndex()) {
+                            val phase = time + idx * 0.9f
+                            val wave = kotlin.math.sin(phase.toDouble()).toFloat()
+                            val r = 0
+                            val g = (80 + 80 * wave).toInt().coerceIn(0, 255)
+                            val b = (180 + 75 * wave).toInt().coerceIn(0, 255)
+                            val waveBr = (br * (0.3f + 0.7f * ((wave + 1f) / 2f))).toInt().coerceIn(0, 255)
+                            animBuffer.append("echo \"$r $g $b\" > $path/multi_intensity\necho $waveBr > $path/brightness\n")
+                        }
+                        JoystickRgbController.executeFastRaw(animBuffer.toString())
+                        time += 0.08f
+                        delay(100L)
+                    }
+                }
+            }
+            RgbMode.POLICE -> {
+                rgbInfoJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    var phase = 0
+                    val leftPaths = Corner.entries.map { ledSysfsPath(Stick.LEFT, it) }
+                    val rightPaths = Corner.entries.map { ledSysfsPath(Stick.RIGHT, it) }
+                    while (isActive) {
+                        val leftColor = if (phase % 2 == 0) "255 0 0" else "0 0 255"
+                        val rightColor = if (phase % 2 == 0) "0 0 255" else "255 0 0"
+                        animBuffer.setLength(0)
+                        for (i in leftPaths.indices) {
+                            animBuffer.append("echo \"$leftColor\" > ${leftPaths[i]}/multi_intensity\necho $br > ${leftPaths[i]}/brightness\n")
+                            animBuffer.append("echo \"$rightColor\" > ${rightPaths[i]}/multi_intensity\necho $br > ${rightPaths[i]}/brightness\n")
+                        }
+                        JoystickRgbController.executeFastRaw(animBuffer.toString())
+                        phase++
+                        delay(if (phase % 4 < 2) 80L else 200L)
+                    }
+                }
+            }
+            RgbMode.STARLIGHT -> {
+                rgbInfoJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val rng = java.util.Random()
+                    val ledList = buildLedList()
+                    while (isActive) {
+                        animBuffer.setLength(0)
+                        for (led in ledList) {
+                            val twinkle = rng.nextFloat()
+                            if (twinkle > 0.6f) {
+                                val hue = rng.nextFloat() * 360f
+                                val (r, g, b) = hsvToRgb(hue, 0.2f, 1f)
+                                animBuffer.append("echo \"$r $g $b\" > $led/multi_intensity\necho $br > $led/brightness\n")
+                            } else {
+                                val dimBr = (br * twinkle * 0.3f).toInt().coerceIn(0, 255)
+                                animBuffer.append("echo \"200 200 255\" > $led/multi_intensity\necho $dimBr > $led/brightness\n")
+                            }
+                        }
+                        JoystickRgbController.executeFastRaw(animBuffer.toString())
+                        delay(100L + rng.nextInt(100).toLong())
+                    }
+                }
+            }
+            RgbMode.MUSIC -> {
+                rgbInfoJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    var recorder: android.media.AudioRecord? = null
+                    try {
+                        val sampleRate = 8000
+                        val bufSize = android.media.AudioRecord.getMinBufferSize(
+                            sampleRate,
+                            android.media.AudioFormat.CHANNEL_IN_MONO,
+                            android.media.AudioFormat.ENCODING_PCM_16BIT
+                        )
+                        recorder = android.media.AudioRecord(
+                            android.media.MediaRecorder.AudioSource.MIC,
+                            sampleRate,
+                            android.media.AudioFormat.CHANNEL_IN_MONO,
+                            android.media.AudioFormat.ENCODING_PCM_16BIT,
+                            bufSize
+                        )
+                        recorder.startRecording()
+                        val buffer = ShortArray(bufSize / 2)
+
+                        while (isActive) {
+                            val read = recorder.read(buffer, 0, buffer.size)
+                            if (read > 0) {
+                                var sum = 0L
+                                for (i in 0 until read) sum += kotlin.math.abs(buffer[i].toInt())
+                                val amplitude = (sum / read).toInt()
+                                val norm = (amplitude / 5000f).coerceIn(0f, 1f)
+                                val hue = 240f - norm * 240f
+                                val (r, g, b) = hsvToRgb(hue.coerceIn(0f, 359f))
+                                val musicBr = (br * (0.1f + norm * 0.9f)).toInt().coerceIn(0, 255)
+                                JoystickRgbController.setAll(r, g, b, musicBr)
+                            }
+                            delay(120L)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Music mode error: ${e.message}")
+                        var hue = 0f
+                        while (isActive) {
+                            val (r, g, b) = hsvToRgb(hue)
+                            JoystickRgbController.setAll(r, g, b, br)
+                            hue = (hue + 2f) % 360f
+                            delay(100L)
+                        }
+                    } finally {
+                        recorder?.stop()
+                        recorder?.release()
+                    }
+                }
+            }
         }
     }
 
-    private var lastScreenColor = Triple(255, 255, 255)
+    /** Get sysfs path for a specific LED */
+    private fun ledSysfsPath(stick: Stick, corner: Corner): String {
+        val prefix = if (stick == Stick.LEFT) "left" else "right"
+        val index = when (stick) {
+            Stick.LEFT -> when (corner) {
+                Corner.TOP_LEFT -> 0; Corner.BOTTOM_LEFT -> 1
+                Corner.BOTTOM_RIGHT -> 2; Corner.TOP_RIGHT -> 3
+            }
+            Stick.RIGHT -> when (corner) {
+                Corner.BOTTOM_RIGHT -> 0; Corner.TOP_RIGHT -> 1
+                Corner.TOP_LEFT -> 2; Corner.BOTTOM_LEFT -> 3
+            }
+        }
+        return "/sys/class/leds/$prefix:stick:$index"
+    }
 
-    private fun getAverageScreenColor(): Triple<Int, Int, Int> {
-        var proc: Process? = null
+    /** Build ordered list of all 8 LED sysfs paths for sequential effects */
+    private fun buildLedList(): List<String> = buildList {
+        add(ledSysfsPath(Stick.LEFT, Corner.TOP_LEFT))
+        add(ledSysfsPath(Stick.LEFT, Corner.TOP_RIGHT))
+        add(ledSysfsPath(Stick.RIGHT, Corner.TOP_LEFT))
+        add(ledSysfsPath(Stick.RIGHT, Corner.TOP_RIGHT))
+        add(ledSysfsPath(Stick.RIGHT, Corner.BOTTOM_RIGHT))
+        add(ledSysfsPath(Stick.RIGHT, Corner.BOTTOM_LEFT))
+        add(ledSysfsPath(Stick.LEFT, Corner.BOTTOM_RIGHT))
+        add(ledSysfsPath(Stick.LEFT, Corner.BOTTOM_LEFT))
+    }
+
+    /** Build flat list of sysfs paths for all stick×corner combos (used by animation loops) */
+    private fun buildLedPathPairs(): List<String> = buildList {
+        for (stick in Stick.entries) {
+            for (corner in Corner.entries) {
+                add(ledSysfsPath(stick, corner))
+            }
+        }
+    }
+
+    private val SCREENCAP_PATH = "/dev/screencap.raw"
+
+    /**
+     * High-performance Ambilight loop.
+     *
+     * All I/O (screencap + LED sysfs writes) goes through a single persistent
+     * `su` process. LED writes from the PREVIOUS frame are pipelined with the
+     * CURRENT frame's screencap so they execute in parallel.
+     *
+     * Pipeline per iteration:
+     *   stdin → "[prev LED writes]; screencap > file && echo F"
+     *   wait for "F" on stdout
+     *   read 8 pixels via RandomAccessFile (kept open, just seek)
+     *   compute colors → build next LED command string
+     *   loop
+     */
+    private suspend fun startAmbilightLoop(maxBr: Int) {
+        if (mediaProjectionIntent == null) {
+            Log.i(TAG, "No MediaProjection token. Launching Activity to acquire it.")
+            val intent = Intent(this, MediaProjectionActivity::class.java)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            return
+        }
+
         try {
-            proc = Runtime.getRuntime().exec(arrayOf("su", "-c", "screencap"))
-            val input = proc.inputStream
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = mpm.getMediaProjection(android.app.Activity.RESULT_OK, mediaProjectionIntent!!)
             
-            val header = ByteArray(12)
-            var bytesRead = 0
-            while (bytesRead < 12) {
-                val r = input.read(header, bytesRead, 12 - bytesRead)
-                if (r == -1) break
-                bytesRead += r
-            }
-            if (bytesRead < 12) {
-                proc.destroy()
-                return lastScreenColor
-            }
+            val width = 16
+            val height = 9
             
-            val width = (header[0].toInt() and 0xFF) or
-                        ((header[1].toInt() and 0xFF) shl 8) or
-                        ((header[2].toInt() and 0xFF) shl 16) or
-                        ((header[3].toInt() and 0xFF) shl 24)
-            val height = (header[4].toInt() and 0xFF) or
-                         ((header[5].toInt() and 0xFF) shl 8) or
-                         ((header[6].toInt() and 0xFF) shl 16) or
-                         ((header[7].toInt() and 0xFF) shl 24)
+            imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
             
-            if (width <= 0 || height <= 0 || width > 4000 || height > 4000) {
-                proc.destroy()
-                return lastScreenColor
-            }
+            mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    super.onStop()
+                    Log.i(TAG, "MediaProjection stopped by system.")
+                }
+            }, null)
+
+            virtualDisplay = mediaProjection?.createVirtualDisplay(
+                "Ambilight",
+                width, height, 160,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader?.surface, null, null
+            )
             
-            val y = height / 2
-            val x1 = width / 4
-            val x2 = width / 2
-            val x3 = (3 * width) / 4
+            Log.i(TAG, "Ambilight 120Hz Hardware-Accelerated VirtualDisplay created (16x9)")
             
-            val offset1 = (y * width + x1) * 4L
-            val offset2 = (y * width + x2) * 4L
-            val offset3 = (y * width + x3) * 4L
+            data class LedZone(val sysfs: String, val x: Int, val y: Int)
             
-            fun readPixelAtOffset(targetOffset: Long, currentOffset: Long): Pair<Triple<Int, Int, Int>?, Long> {
-                val toSkip = targetOffset - currentOffset
-                if (toSkip < 0) return Pair(null, currentOffset)
+            val zones = arrayOf(
+                LedZone("left:stick:0",  0, 0),                        // Left TL
+                LedZone("left:stick:1",  0, height-1),                 // Left BL
+                LedZone("left:stick:2",  width/4, height-1),           // Left BR
+                LedZone("left:stick:3",  width/4, 0),                  // Left TR
+                LedZone("right:stick:2", width-1 - width/4, 0),        // Right TL
+                LedZone("right:stick:1", width-1, 0),                  // Right TR
+                LedZone("right:stick:3", width-1 - width/4, height-1), // Right BL
+                LedZone("right:stick:0", width-1, height-1)            // Right BR
+            )
+
+            var lastExecTime = 0L
+
+            imageReader?.setOnImageAvailableListener({ reader ->
+                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
                 
-                var skipped = 0L
-                while (skipped < toSkip) {
-                    val s = input.skip(toSkip - skipped)
-                    if (s <= 0) break
-                    skipped += s
+                // Cap at 60fps to prevent overloading the I2C bus while keeping 0 latency
+                val now = System.currentTimeMillis()
+                if (now - lastExecTime < 16) {
+                    image.close()
+                    return@setOnImageAvailableListener
+                }
+                lastExecTime = now
+
+                val plane = image.planes[0]
+                val buffer = plane.buffer
+                val pixelStride = plane.pixelStride
+                val rowStride = plane.rowStride
+                
+                animBuffer.setLength(0)
+                
+                for (zone in zones) {
+                    val offset = zone.y * rowStride + zone.x * pixelStride
+                    buffer.position(offset)
+                    val r = buffer.get().toInt() and 0xFF
+                    val g = buffer.get().toInt() and 0xFF
+                    val b = buffer.get().toInt() and 0xFF
+                    
+                    val lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+                    val br = (maxBr * lum).toInt().coerceIn(1, 255)
+                    
+                    val base = "/sys/class/leds/${zone.sysfs}"
+                    animBuffer.append("echo \"$r $g $b\">$base/multi_intensity\necho $br>$base/brightness\n")
                 }
                 
-                val pixel = ByteArray(4)
-                var rBytes = 0
-                while (rBytes < 4) {
-                    val r = input.read(pixel, rBytes, 4 - rBytes)
-                    if (r == -1) break
-                    rBytes += r
-                }
-                if (rBytes < 4) return Pair(null, currentOffset + skipped)
+                image.close()
+                JoystickRgbController.executeFastRaw(animBuffer.toString())
                 
-                val red = pixel[0].toInt() and 0xFF
-                val green = pixel[1].toInt() and 0xFF
-                val blue = pixel[2].toInt() and 0xFF
-                return Pair(Triple(red, green, blue), currentOffset + skipped + 4)
+            }, Handler(Looper.getMainLooper()))
+            
+            // Suspend coroutine while listener is active
+            while (kotlin.coroutines.coroutineContext.isActive) {
+                delay(1000L)
             }
             
-            var curOffset = 0L
-            val (p1, o1) = readPixelAtOffset(offset1, curOffset)
-            val (p2, o2) = readPixelAtOffset(offset2, o1)
-            val (p3, _) = readPixelAtOffset(offset3, o2)
-            
-            proc.destroy()
-            
-            val validPixels = listOfNotNull(p1, p2, p3)
-            if (validPixels.isEmpty()) return lastScreenColor
-            
-            val avgR = validPixels.map { it.first }.average().toInt()
-            val avgG = validPixels.map { it.second }.average().toInt()
-            val avgB = validPixels.map { it.third }.average().toInt()
-            
-            val resultColor = Triple(avgR, avgG, avgB)
-            lastScreenColor = resultColor
-            return resultColor
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to get screen color: ${e.message}")
-            proc?.destroy()
-            return lastScreenColor
+            Log.e(TAG, "Ambilight error: ${e.message}")
+        } finally {
+            virtualDisplay?.release()
+            imageReader?.close()
+            mediaProjection?.stop()
+            virtualDisplay = null
+            imageReader = null
+            mediaProjection = null
+            mediaProjectionIntent = null // MUST reset token because Android 14 does not allow re-using the same intent
         }
     }
 
@@ -682,6 +969,11 @@ class SystemControlService : Service() {
     }
 
     private fun updateNotification() {
-        notifManager.notify(NOTIF_ID, buildNotification())
+        val notif = buildNotification()
+        // Dirty flag: skip if content hasn't changed
+        val contentText = notif.extras?.getString(Notification.EXTRA_TEXT) ?: ""
+        if (contentText == lastNotifText) return
+        lastNotifText = contentText
+        notifManager.notify(NOTIF_ID, notif)
     }
 }
