@@ -3,7 +3,7 @@
 A premium system configuration utility designed specifically for the **Retroid Pocket 6** running LineageOS (Android). This application integrates directly into the native AOSP Settings app and provides advanced hardware controls for cooling, performance, and aesthetics.
 
 ---
-
+I SOLD MY RP6 SO NO MORE UPDATES
 ## 🚀 Features
 
 ### 1. 🌀 Advanced Cooling & Fan Control
